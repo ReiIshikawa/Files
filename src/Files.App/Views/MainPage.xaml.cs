@@ -7,6 +7,7 @@ using Files.App.Controls;
 using Microsoft.Extensions.Logging;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Input;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
@@ -40,6 +41,11 @@ namespace Files.App.Views
 
 		private DispatcherQueueTimer _updateDateDisplayTimer;
 		private WindowMessageMonitor? _titleBarMessageMonitor;
+		private AppWindow? _titleBarAppWindow;
+		private XamlRoot? _titleBarXamlRoot;
+		private double _lastTitleBarRasterizationScale;
+		private bool _isTitleBarDragRegionUpdateQueued;
+		private int _titleBarDragRegionSubscriptionGeneration;
 
 		private readonly Dictionary<TabBarItem, double> _sidebarScrollByTab = new();
 		private TabBarItem? _previousSidebarTab;
@@ -76,6 +82,7 @@ namespace Files.App.Views
 			FindName(nameof(InnerNavigationToolbar));
 			FindName(nameof(TabControl));
 			FindName(nameof(NavToolbar));
+			Unloaded += Page_Unloaded;
 		}
 
 		private void NumberedTabKeyboardAccelerator_Invoked(KeyboardAccelerator sender, KeyboardAcceleratorInvokedEventArgs e)
@@ -125,13 +132,162 @@ namespace Files.App.Views
 
 		private void HorizontalMultitaskingControl_Loaded(object sender, RoutedEventArgs e)
 		{
-			TabControl.DragArea.SizeChanged += (_, _) => MainWindow.Instance.RaiseSetTitleBarDragRegion(SetTitleBarDragRegion);
-			TabControl.SizeChanged += (_, _) => MainWindow.Instance.RaiseSetTitleBarDragRegion(SetTitleBarDragRegion);
 			if (ViewModel.MultitaskingControl is not TabBar)
 			{
 				ViewModel.MultitaskingControl = TabControl;
 				ViewModel.MultitaskingControls.Add(TabControl);
 				ViewModel.MultitaskingControl.CurrentInstanceChanged += MultitaskingControl_CurrentInstanceChanged;
+			}
+		}
+
+		private void SubscribeTitleBarDragRegionEvents()
+		{
+			UnsubscribeTitleBarDragRegionEvents();
+
+			try
+			{
+				var appWindow = MainWindow.Instance.AppWindow;
+				if (appWindow is not null)
+				{
+					_titleBarAppWindow = appWindow;
+					appWindow.Changed += MainWindow_AppWindow_Changed;
+				}
+			}
+			catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+			{
+				// Ignore RO_E_CLOSED during window teardown.
+			}
+
+			try
+			{
+				var xamlRoot = XamlRoot ?? MainWindow.Instance.Content?.XamlRoot;
+				if (xamlRoot is not null)
+				{
+					_titleBarXamlRoot = xamlRoot;
+					_lastTitleBarRasterizationScale = xamlRoot.RasterizationScale;
+					xamlRoot.Changed += TitleBar_XamlRoot_Changed;
+				}
+			}
+			catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+			{
+				// Ignore RO_E_CLOSED during window teardown.
+			}
+
+			if (TabControl is not null)
+			{
+				TabControl.SizeChanged += TitleBarElement_SizeChanged;
+				if (TabControl.DragArea is not null)
+					TabControl.DragArea.SizeChanged += TitleBarElement_SizeChanged;
+			}
+		}
+
+		private void UnsubscribeTitleBarDragRegionEvents()
+		{
+			if (_titleBarAppWindow is not null)
+			{
+				try
+				{
+					_titleBarAppWindow.Changed -= MainWindow_AppWindow_Changed;
+				}
+				catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+				{
+					// Ignore RO_E_CLOSED during window teardown.
+				}
+
+				_titleBarAppWindow = null;
+			}
+
+			if (_titleBarXamlRoot is not null)
+			{
+				try
+				{
+					_titleBarXamlRoot.Changed -= TitleBar_XamlRoot_Changed;
+				}
+				catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+				{
+					// Ignore RO_E_CLOSED during window teardown.
+				}
+
+				_titleBarXamlRoot = null;
+			}
+
+			if (TabControl is not null)
+			{
+				TabControl.SizeChanged -= TitleBarElement_SizeChanged;
+				if (TabControl.DragArea is not null)
+					TabControl.DragArea.SizeChanged -= TitleBarElement_SizeChanged;
+			}
+
+			_titleBarDragRegionSubscriptionGeneration++;
+			_isTitleBarDragRegionUpdateQueued = false;
+		}
+
+		private void MainWindow_AppWindow_Changed(AppWindow sender, AppWindowChangedEventArgs args)
+		{
+			if (DragZoneHelper.ShouldRefreshTitleBarDragRegion(sender, args))
+				QueueTitleBarDragRegionUpdate();
+		}
+
+		private void TitleBar_XamlRoot_Changed(XamlRoot sender, XamlRootChangedEventArgs args)
+		{
+			double scale;
+			try
+			{
+				scale = sender.RasterizationScale;
+			}
+			catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+			{
+				return;
+			}
+
+			if (scale == _lastTitleBarRasterizationScale)
+				return;
+
+			_lastTitleBarRasterizationScale = scale;
+			QueueTitleBarDragRegionUpdate();
+		}
+
+		private void TitleBarElement_SizeChanged(object sender, SizeChangedEventArgs e)
+			=> QueueTitleBarDragRegionUpdate();
+
+		private void QueueTitleBarDragRegionUpdate()
+		{
+			if (_isTitleBarDragRegionUpdateQueued || !IsLoaded || App.AppModel.IsMainWindowClosed)
+				return;
+
+			var generation = _titleBarDragRegionSubscriptionGeneration;
+			_isTitleBarDragRegionUpdateQueued = true;
+			if (!DispatcherQueue.TryEnqueue(() => UpdateTitleBarDragRegionFromQueue(generation)))
+				_isTitleBarDragRegionUpdateQueued = false;
+		}
+
+		private void UpdateTitleBarDragRegionFromQueue(int generation)
+		{
+			if (generation != _titleBarDragRegionSubscriptionGeneration)
+				return;
+
+			_isTitleBarDragRegionUpdateQueued = false;
+			UpdateTitleBarDragRegion();
+		}
+
+		private void UpdateTitleBarDragRegion()
+		{
+			if (!IsLoaded || App.AppModel.IsMainWindowClosed || TabControl is null)
+				return;
+
+			try
+			{
+				if (MainWindow.Instance.AppWindow is not { IsVisible: true })
+					return;
+
+				if (_titleBarXamlRoot is not null)
+					_lastTitleBarRasterizationScale = _titleBarXamlRoot.RasterizationScale;
+
+				MainWindow.Instance.RaiseSetTitleBarDragRegion(SetTitleBarDragRegion);
+				AttachTitleBarMessageMonitor();
+			}
+			catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+			{
 			}
 		}
 
@@ -142,7 +298,6 @@ namespace Files.App.Views
 
 			var height = (int)TabControl.ActualHeight;
 			source.SetRegionRects(NonClientRegionKind.Passthrough, [getScaledRect(this, new RectInt32(0, 0, (int)(TabControl.ActualWidth + TabControl.Margin.Left - TabControl.DragArea.ActualWidth), height))]);
-			AttachTitleBarMessageMonitor();
 			return height;
 		}
 
@@ -341,9 +496,8 @@ namespace Files.App.Views
 		{
 			ViewModel.OnPageLoaded();
 
-			MainWindow.Instance.AppWindow.Changed += (_, _) => MainWindow.Instance.RaiseSetTitleBarDragRegion(SetTitleBarDragRegion);
-
-			MainWindow.Instance.RaiseSetTitleBarDragRegion(SetTitleBarDragRegion);
+			SubscribeTitleBarDragRegionEvents();
+			UpdateTitleBarDragRegion();
 
 			// Notify user that drag and drop is disabled
 			// Prompt is disabled in the dev environment to prevent issues with the automation testing 
@@ -358,6 +512,9 @@ namespace Files.App.Views
 				DispatcherQueue.TryEnqueue(async () => await AppRunningAsAdminPromptAsync());
 			}
 		}
+
+		private void Page_Unloaded(object sender, RoutedEventArgs e)
+			=> UnsubscribeTitleBarDragRegionEvents();
 
 		private void PreviewPane_Loaded(object sender, RoutedEventArgs e)
 		{

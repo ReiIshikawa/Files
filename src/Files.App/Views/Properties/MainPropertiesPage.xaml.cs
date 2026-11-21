@@ -22,6 +22,12 @@ namespace Files.App.Views.Properties
 		private Window Window = null!;
 
 		private MainPropertiesViewModel MainPropertiesViewModel { get; set; } = null!;
+		private AppWindow? _titleBarAppWindow;
+		private XamlRoot? _titleBarXamlRoot;
+		private double _lastTitleBarRasterizationScale;
+		private bool _isTitleBarDragRegionUpdateQueued;
+		private int _titleBarDragRegionSubscriptionGeneration;
+		private bool _isWindowClosed;
 
 		public MainPropertiesPage()
 		{
@@ -29,6 +35,8 @@ namespace Files.App.Views.Properties
 
 			if (AppLanguageHelper.IsPreferredLanguageRtl)
 				FlowDirection = FlowDirection.RightToLeft;
+
+			Unloaded += Page_Unloaded;
 		}
 
 
@@ -64,14 +72,23 @@ namespace Files.App.Views.Properties
 
 		private void Page_Loaded(object sender, RoutedEventArgs e)
 		{
+			_isWindowClosed = false;
+			AppThemeModeService.AppThemeModeChanged -= AppThemeModeService_AppThemeModeChanged;
 			AppThemeModeService.AppThemeModeChanged += AppThemeModeService_AppThemeModeChanged;
+			Window.Closed -= Window_Closed;
 			Window.Closed += Window_Closed;
 
 			AppThemeModeService.ApplyResources();
 			UpdatePageLayout(this.Width);
 			PropertiesSidebar.SelectedItem = MainPropertiesViewModel.SelectedNavigationItem;
-			Window.RaiseSetTitleBarDragRegion(SetTitleBarDragRegion);
-			Window.AppWindow.Changed += AppWindow_Changed;
+			SubscribeTitleBarDragRegionEvents();
+			UpdateTitleBarDragRegion();
+		}
+
+		private void Page_Unloaded(object sender, RoutedEventArgs e)
+		{
+			AppThemeModeService.AppThemeModeChanged -= AppThemeModeService_AppThemeModeChanged;
+			UnsubscribeTitleBarDragRegionEvents();
 		}
 
 		private int SetTitleBarDragRegion(InputNonClientPointerSource source, SizeInt32 size, double scaleFactor, Func<UIElement, RectInt32?, RectInt32> getScaledRect)
@@ -107,9 +124,10 @@ namespace Files.App.Views.Properties
 
 		private void Window_Closed(object sender, WindowEventArgs args)
 		{
+			_isWindowClosed = true;
 			AppThemeModeService.AppThemeModeChanged -= AppThemeModeService_AppThemeModeChanged;
 			Window.Closed -= Window_Closed;
-			Window.AppWindow.Changed -= AppWindow_Changed;
+			UnsubscribeTitleBarDragRegionEvents();
 
 			if (MainPropertiesViewModel.ChangedPropertiesCancellationTokenSource is not null &&
 				!MainPropertiesViewModel.ChangedPropertiesCancellationTokenSource.IsCancellationRequested)
@@ -118,9 +136,144 @@ namespace Files.App.Views.Properties
 			}
 		}
 
+		private void SubscribeTitleBarDragRegionEvents()
+		{
+			UnsubscribeTitleBarDragRegionEvents();
+
+			if (Window is not null)
+			{
+				try
+				{
+					var appWindow = Window.AppWindow;
+					if (appWindow is not null)
+					{
+						_titleBarAppWindow = appWindow;
+						appWindow.Changed += AppWindow_Changed;
+					}
+				}
+				catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+				{
+				}
+			}
+
+			try
+			{
+				var xamlRoot = XamlRoot ?? Window?.Content?.XamlRoot;
+				if (xamlRoot is not null)
+				{
+					_titleBarXamlRoot = xamlRoot;
+					_lastTitleBarRasterizationScale = xamlRoot.RasterizationScale;
+					xamlRoot.Changed += TitleBar_XamlRoot_Changed;
+				}
+			}
+			catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+			{
+			}
+
+			TitlebarArea.SizeChanged += TitleBarElement_SizeChanged;
+			BackwardNavigationButton.SizeChanged += TitleBarElement_SizeChanged;
+		}
+
+		private void UnsubscribeTitleBarDragRegionEvents()
+		{
+			if (_titleBarAppWindow is not null)
+			{
+				try
+				{
+					_titleBarAppWindow.Changed -= AppWindow_Changed;
+				}
+				catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+				{
+				}
+
+				_titleBarAppWindow = null;
+			}
+
+			if (_titleBarXamlRoot is not null)
+			{
+				try
+				{
+					_titleBarXamlRoot.Changed -= TitleBar_XamlRoot_Changed;
+				}
+				catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+				{
+				}
+
+				_titleBarXamlRoot = null;
+			}
+
+			TitlebarArea.SizeChanged -= TitleBarElement_SizeChanged;
+			BackwardNavigationButton.SizeChanged -= TitleBarElement_SizeChanged;
+			_titleBarDragRegionSubscriptionGeneration++;
+			_isTitleBarDragRegionUpdateQueued = false;
+		}
+
 		private void AppWindow_Changed(AppWindow sender, AppWindowChangedEventArgs e)
 		{
-			Window.RaiseSetTitleBarDragRegion(SetTitleBarDragRegion);
+			if (DragZoneHelper.ShouldRefreshTitleBarDragRegion(sender, e))
+				QueueTitleBarDragRegionUpdate();
+		}
+
+		private void TitleBar_XamlRoot_Changed(XamlRoot sender, XamlRootChangedEventArgs args)
+		{
+			double scale;
+			try
+			{
+				scale = sender.RasterizationScale;
+			}
+			catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+			{
+				return;
+			}
+
+			if (scale == _lastTitleBarRasterizationScale)
+				return;
+
+			_lastTitleBarRasterizationScale = scale;
+			QueueTitleBarDragRegionUpdate();
+		}
+
+		private void TitleBarElement_SizeChanged(object sender, SizeChangedEventArgs e)
+			=> QueueTitleBarDragRegionUpdate();
+
+		private void QueueTitleBarDragRegionUpdate()
+		{
+			if (_isTitleBarDragRegionUpdateQueued || _isWindowClosed || !IsLoaded)
+				return;
+
+			var generation = _titleBarDragRegionSubscriptionGeneration;
+			_isTitleBarDragRegionUpdateQueued = true;
+			if (!DispatcherQueue.TryEnqueue(() => UpdateTitleBarDragRegionFromQueue(generation)))
+				_isTitleBarDragRegionUpdateQueued = false;
+		}
+
+		private void UpdateTitleBarDragRegionFromQueue(int generation)
+		{
+			if (generation != _titleBarDragRegionSubscriptionGeneration)
+				return;
+
+			_isTitleBarDragRegionUpdateQueued = false;
+			UpdateTitleBarDragRegion();
+		}
+
+		private void UpdateTitleBarDragRegion()
+		{
+			if (_isWindowClosed || !IsLoaded || Window is null)
+				return;
+
+			try
+			{
+				if (Window.AppWindow is not { IsVisible: true })
+					return;
+
+				if (_titleBarXamlRoot is not null)
+					_lastTitleBarRasterizationScale = _titleBarXamlRoot.RasterizationScale;
+
+				Window.RaiseSetTitleBarDragRegion(SetTitleBarDragRegion);
+			}
+			catch (Exception ex) when (DragZoneHelper.IsClosedObjectException(ex))
+			{
+			}
 		}
 
 		public override async Task<bool> SaveChangesAsync()

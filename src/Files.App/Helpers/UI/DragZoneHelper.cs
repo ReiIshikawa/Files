@@ -2,7 +2,9 @@
 // Licensed under the MIT License.
 
 using Microsoft.UI.Input;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
+using System.Runtime.InteropServices;
 using Windows.Graphics;
 
 namespace Files.App.Helpers
@@ -10,6 +12,24 @@ namespace Files.App.Helpers
 	public static class DragZoneHelper
 	{
 		public delegate int SetTitleBarDragRegionDelegate(InputNonClientPointerSource source, SizeInt32 size, double scaleFactor, Func<UIElement, RectInt32?, RectInt32> getScaledRect);
+
+		public static bool ShouldRefreshTitleBarDragRegion(AppWindow sender, AppWindowChangedEventArgs args)
+		{
+			try
+			{
+				if (!args.DidSizeChange && !args.DidPresenterChange && !args.DidVisibilityChange)
+					return false;
+
+				return sender.IsVisible;
+			}
+			catch (Exception ex) when (IsClosedObjectException(ex))
+			{
+				return false;
+			}
+		}
+
+		internal static bool IsClosedObjectException(Exception ex)
+			=> ex is ObjectDisposedException || (ex is COMException comEx && comEx.HResult == unchecked((int)0x80000013));
 
 		/// <summary>
 		/// Informs the bearer to refresh the drag region.
